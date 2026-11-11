@@ -27,7 +27,7 @@ object TwoFingerRotationHook {
     private var threeFingerSwipeDetector: ThreeFingerSwipeGestureDetector? = null
     private var tripleTapDetector: ThreeFingerTripleTapDetector? = null
 
-    private var lastEventTime: Long = 0L
+    private val touchStreamArbiter = TouchStreamArbiter()
 
     fun hook(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "android") return
@@ -221,15 +221,28 @@ object TwoFingerRotationHook {
     /**
      * 统一接收触摸事件流（带去重抑制）
      */
+    @Synchronized
     fun onMotionEventReceived(event: MotionEvent, channel: String) {
-        val eventTime = event.eventTime
+        // Do not mix mouse streams into touchscreen gesture state via IMS.
+        if (!event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN)) return
         val action = event.actionMasked
-
-        // 防止多通道对同一个 Move 事件重复处理
-        if (eventTime == lastEventTime && action == MotionEvent.ACTION_MOVE) {
-            return
+        when (touchStreamArbiter.accept(event.downTime, event.deviceId, action, channel)) {
+            TouchStreamArbiter.Decision.DROP -> return
+            TouchStreamArbiter.Decision.RESTART -> {
+                // If an owner lost UP/CANCEL, cancel its incomplete gesture before
+                // accepting the next DOWN (which can choose the other channel).
+                val cancel = MotionEvent.obtain(event)
+                try {
+                    cancel.action = MotionEvent.ACTION_CANCEL
+                    gestureDetector?.onPointerEvent(cancel)
+                    threeFingerSwipeDetector?.onPointerEvent(cancel)
+                    tripleTapDetector?.onPointerEvent(cancel)
+                } finally {
+                    cancel.recycle()
+                }
+            }
+            TouchStreamArbiter.Decision.ACCEPT -> Unit
         }
-        lastEventTime = eventTime
 
         if (event.pointerCount >= 2 && action == MotionEvent.ACTION_POINTER_DOWN) {
             XposedBridge.log("[$TAG] Touch stream active on $channel (pointers=${event.pointerCount}, action=$action)")
