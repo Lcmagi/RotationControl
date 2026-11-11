@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -18,10 +18,11 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
       - uses: gradle/actions/setup-gradle@v4
-      - name: Install Android SDK
-        run: sdkmanager 'platforms;android-35' 'build-tools;34.0.0'
+      - name: Check preinstalled Android SDK
+        run: |
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
+          test -x "$ANDROID_HOME/build-tools/34.0.0/apksigner"
       - name: Run JVM regression tests and build signed debug APK
         run: bash ./gradlew --no-daemon testDebugUnitTest assembleDebug
       - name: Verify APK signature and record build identity
@@ -45,6 +46,3 @@ jobs:
           name: unit-test-results
           path: app/build/reports/tests/testDebugUnitTest/
           if-no-files-found: ignore
-      - name: Clean build outputs
-        if: always()
-        run: bash ./gradlew --no-daemon clean
