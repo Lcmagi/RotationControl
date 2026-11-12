@@ -1,11 +1,7 @@
 package io.github.benbaobaoshigemi.rotationcontrol
 
-import android.content.Context
-import android.os.SystemClock
-import android.util.DisplayMetrics
 import android.view.MotionEvent
 import android.view.Surface
-import de.robv.android.xposed.XposedBridge
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
@@ -27,13 +23,11 @@ import kotlin.math.min
  *      - 靠近物理右边（音量键端） -> 物理右边成为目标显示顶部 (ROTATION_90)
  *      - 靠近物理左边（磁吸端）   -> 物理左边成为目标显示顶部 (ROTATION_270)
  */
-class ScreenRotationGestureDetector(
-    private val contextProvider: () -> Context?,
+internal class ScreenRotationGestureDetector(
+    private val display: GestureDisplay,
     private val onRotateAction: (targetRotation: Int, reason: String) -> Unit
 ) {
     companion object {
-        private const val TAG = "LSPosed-RotationGesture"
-
         // 阈值定义（严谨过滤长按与普通滑动，基于物理像素）
         private const val MAX_TAP_DURATION_MS = 400L    // 单次敲击时长上限，超过视为长按/按压，丢弃
         private const val MAX_DOUBLE_TAP_GAP_MS = 450L  // 两次点击之间的最大间隔时间，超过重置
@@ -48,7 +42,7 @@ class ScreenRotationGestureDetector(
         IN_TAP_2
     }
 
-    private data class Point(val x: Float, val y: Float)
+    private class Point(var x: Float, var y: Float)
 
     private data class TapRecord(
         val pA_phys: Point,
@@ -56,7 +50,6 @@ class ScreenRotationGestureDetector(
         val centroid_phys: Point,
         val deltaX_phys: Float,
         val deltaY_phys: Float,
-        val timeDown: Long,
         val timeUp: Long
     )
 
@@ -65,7 +58,10 @@ class ScreenRotationGestureDetector(
     // 当前敲击过程中的状态跟踪
     private var tapDownTime: Long = 0L
     private var maxPointersInTap: Int = 0
-    private var isDisqualified: Boolean = false
+    private var firstDownX = 0f
+    private var firstDownY = 0f
+    private var tapDisplay: GestureDisplaySnapshot? = null
+    private var firstTapDisplay: GestureDisplaySnapshot? = null
 
     // 双指在机身绝对物理坐标系下的记录
     private var p0StartPhys: Point? = null
@@ -76,19 +72,7 @@ class ScreenRotationGestureDetector(
     // 第一次敲击物理记录
     private var tap1Record: TapRecord? = null
 
-    @Synchronized
-    fun onPointerEvent(event: MotionEvent) {
-        val actionMasked = event.actionMasked
-        val pointerCount = event.pointerCount
-        val now = SystemClock.uptimeMillis()
-        val density = getDisplayDensity()
-        val maxSlopPx = MAX_SLOP_DP * density
-        val maxDriftPx = MAX_DRIFT_DP * density
-
-        // 获取当前屏幕显示旋转和尺寸，将事件坐标立即逆变换为机身绝对物理坐标
-        val currentRotation = getCurrentRotation()
-        val (wDisp, hDisp) = getScreenDimensions()
-
+    fun onPointerEvent(event: MotionEvent, actionMasked: Int, pointerCount: Int, now: Long) {
         // 更新单次敲击中出现过的最大指针数
         if (pointerCount > maxPointersInTap) {
             maxPointersInTap = pointerCount
@@ -96,8 +80,7 @@ class ScreenRotationGestureDetector(
 
         // 若检测到 3 指及以上，立即废弃本手势（避免干扰系统三指截屏/分屏）
         if (pointerCount >= 3) {
-            isDisqualified = true
-            resetToIdle("Disqualified: pointerCount >= 3 ($pointerCount)")
+            resetToIdle()
             return
         }
 
@@ -120,83 +103,80 @@ class ScreenRotationGestureDetector(
 
                 tapDownTime = now
                 maxPointersInTap = 1
-                isDisqualified = false
 
-                val p0Phys = toPhysicalPoint(event.getX(0), event.getY(0), currentRotation, wDisp, hDisp)
-                p0StartPhys = p0Phys
-                p0CurrentPhys = p0Phys
+                firstDownX = event.getX(0)
+                firstDownY = event.getY(0)
+                tapDisplay = null
+                p0StartPhys = null
                 p1StartPhys = null
+                p0CurrentPhys = null
                 p1CurrentPhys = null
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
-                // 第二根手指触碰屏幕
-                if (pointerCount == 2) {
-                    val p0Phys = toPhysicalPoint(event.getX(0), event.getY(0), currentRotation, wDisp, hDisp)
-                    val p1Phys = toPhysicalPoint(event.getX(1), event.getY(1), currentRotation, wDisp, hDisp)
-                    if (p0StartPhys == null) p0StartPhys = p0Phys
-                    p0CurrentPhys = p0Phys
-                    p1StartPhys = p1Phys
-                    p1CurrentPhys = p1Phys
+                if (pointerCount != 2 || currentState == State.IDLE) return
 
-                    XposedBridge.log(
-                        "[$TAG] Two fingers down: p0_phys=(${p0Phys.x.toInt()}, ${p0Phys.y.toInt()}), p1_phys=(${p1Phys.x.toInt()}, ${p1Phys.y.toInt()}) [DisplayRotation=$currentRotation, State=$currentState]"
-                    )
-                } else if (pointerCount > 2) {
-                    isDisqualified = true
+                val geometry = display.read()
+                val previousGeometry = tapDisplay
+                if (previousGeometry != null && previousGeometry != geometry) {
+                    resetToIdle()
+                    return
                 }
+                if (currentState == State.IN_TAP_2 && firstTapDisplay != geometry) {
+                    // A fold/rotation between taps starts a new pair.
+                    tap1Record = null
+                    firstTapDisplay = null
+                    currentState = State.IN_TAP_1
+                }
+                tapDisplay = geometry
+                if (p0StartPhys == null) {
+                    p0StartPhys = physicalPoint(firstDownX, firstDownY, geometry)
+                }
+                val p1Start = physicalPoint(event.getX(1), event.getY(1), geometry)
+                p1StartPhys = p1Start
+                p0CurrentPhys = physicalPoint(event.getX(0), event.getY(0), geometry)
+                p1CurrentPhys = Point(p1Start.x, p1Start.y)
             }
 
             MotionEvent.ACTION_MOVE -> {
-                if (isDisqualified) return
-                if (pointerCount == 2) {
-                    val p0Phys = toPhysicalPoint(event.getX(0), event.getY(0), currentRotation, wDisp, hDisp)
-                    val p1Phys = toPhysicalPoint(event.getX(1), event.getY(1), currentRotation, wDisp, hDisp)
-                    p0CurrentPhys = p0Phys
-                    p1CurrentPhys = p1Phys
+                if (pointerCount != 2) return
+                val geometry = tapDisplay ?: return
+                val p0 = p0CurrentPhys ?: return
+                val p1 = p1CurrentPhys ?: return
+                setPhysicalPoint(p0, event.getX(0), event.getY(0), geometry)
+                setPhysicalPoint(p1, event.getX(1), event.getY(1), geometry)
 
-                    // 检查绝对物理位移（严格防止滑动或捏合误触）
-                    p0StartPhys?.let { start0 ->
-                        if (hypot(p0Phys.x - start0.x, p0Phys.y - start0.y) > maxSlopPx) {
-                            isDisqualified = true
-                            resetToIdle("Disqualified: p0 physical slop exceeded")
-                            return
-                        }
-                    }
-                    p1StartPhys?.let { start1 ->
-                        if (hypot(p1Phys.x - start1.x, p1Phys.y - start1.y) > maxSlopPx) {
-                            isDisqualified = true
-                            resetToIdle("Disqualified: p1 physical slop exceeded")
-                            return
-                        }
-                    }
+                val maxSlopPx = MAX_SLOP_DP * geometry.density
+                val start0 = p0StartPhys
+                val start1 = p1StartPhys
+                if ((start0 != null && hypot(p0.x - start0.x, p0.y - start0.y) > maxSlopPx) ||
+                    (start1 != null && hypot(p1.x - start1.x, p1.y - start1.y) > maxSlopPx)
+                ) {
+                    resetToIdle()
                 }
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
-                // 双指中的某一根手指抬起，保留抬起瞬间的最后有效物理双指坐标
-                if (pointerCount == 2 && p0CurrentPhys != null && p1CurrentPhys != null) {
-                    p0CurrentPhys = toPhysicalPoint(event.getX(0), event.getY(0), currentRotation, wDisp, hDisp)
-                    p1CurrentPhys = toPhysicalPoint(event.getX(1), event.getY(1), currentRotation, wDisp, hDisp)
-                }
+                if (pointerCount != 2) return
+                val geometry = tapDisplay ?: return
+                val p0 = p0CurrentPhys ?: return
+                val p1 = p1CurrentPhys ?: return
+                setPhysicalPoint(p0, event.getX(0), event.getY(0), geometry)
+                setPhysicalPoint(p1, event.getX(1), event.getY(1), geometry)
             }
 
             MotionEvent.ACTION_UP -> {
                 // 全部手指离开屏幕，验证本单次点击是否合规
-                val duration = now - tapDownTime
-                val isTapValid = !isDisqualified &&
-                        maxPointersInTap == 2 &&
-                        duration <= MAX_TAP_DURATION_MS &&
-                        p0CurrentPhys != null &&
-                        p1CurrentPhys != null
-
-                if (!isTapValid) {
-                    resetToIdle("Tap invalid (duration=$duration ms, maxPointers=$maxPointersInTap, disq=$isDisqualified)")
+                val geometry = tapDisplay
+                val pA = p0CurrentPhys
+                val pB = p1CurrentPhys
+                if (geometry == null || pA == null || pB == null || maxPointersInTap != 2 ||
+                    now - tapDownTime > MAX_TAP_DURATION_MS || display.read() != geometry
+                ) {
+                    resetToIdle()
                     return
                 }
 
-                val pA = p0CurrentPhys!!
-                val pB = p1CurrentPhys!!
                 val centroid = Point((pA.x + pB.x) / 2f, (pA.y + pB.y) / 2f)
                 val deltaX = abs(pA.x - pB.x)
                 val deltaY = abs(pA.y - pB.y)
@@ -207,42 +187,38 @@ class ScreenRotationGestureDetector(
                     centroid_phys = centroid,
                     deltaX_phys = deltaX,
                     deltaY_phys = deltaY,
-                    timeDown = tapDownTime,
                     timeUp = now
                 )
 
                 if (currentState == State.IN_TAP_1) {
                     // 第一次双指敲击顺利通过，进入等待第二次敲击阶段
                     tap1Record = tapRecord
+                    firstTapDisplay = geometry
                     currentState = State.WAITING_FOR_TAP_2
-                    XposedBridge.log(
-                        "[$TAG] Tap 1 detected: physical centroid=(${centroid.x.toInt()}, ${centroid.y.toInt()}), span=(dx=${deltaX.toInt()}, dy=${deltaY.toInt()}), duration=$duration ms"
-                    )
                 } else if (currentState == State.IN_TAP_2) {
                     // 第二次双指敲击完成！检查两次点击之间的中心位置物理漂移
                     val t1 = tap1Record
                     if (t1 == null) {
-                        resetToIdle("Tap 2 without Tap 1 record")
+                        resetToIdle()
                         return
                     }
 
                     val drift = hypot(centroid.x - t1.centroid_phys.x, centroid.y - t1.centroid_phys.y)
-                    if (drift > maxDriftPx) {
-                        resetToIdle("Tap 2 drift too large: $drift px > $maxDriftPx px")
+                    if (drift > MAX_DRIFT_DP * geometry.density) {
+                        resetToIdle()
                         return
                     }
 
                     // 校验全部通过：执行第一性物理指向决策！
-                    XposedBridge.log("[$TAG] Tap 2 confirmed! drift=$drift px. Resolving target display top...")
-                    processGestureResult(t1, tapRecord, wDisp, hDisp)
-                    resetToIdle("Gesture execution complete")
+                    processGestureResult(t1, tapRecord, geometry.width, geometry.height)
+                    resetToIdle()
                 } else {
-                    resetToIdle("Unexpected ACTION_UP in state $currentState")
+                    resetToIdle()
                 }
             }
 
             MotionEvent.ACTION_CANCEL -> {
-                resetToIdle("ACTION_CANCEL received")
+                resetToIdle()
             }
         }
     }
@@ -265,10 +241,6 @@ class ScreenRotationGestureDetector(
         // 3. 计算双指在机身绝对物理坐标系下的平均跨度（连线方向向量）
         val meanDeltaXPhys = (t1.deltaX_phys + t2.deltaX_phys) / 2.0f
         val meanDeltaYPhys = (t1.deltaY_phys + t2.deltaY_phys) / 2.0f
-
-        XposedBridge.log(
-            "[$TAG] First-Principles: avgPhys=(${avgPhysX.toInt()}, ${avgPhysY.toInt()}), spanPhys=(dx=${meanDeltaXPhys.toInt()}, dy=${meanDeltaYPhys.toInt()}), panelPhys=(${wPhys.toInt()}x${hPhys.toInt()})"
-        )
 
         // 4. 指向判定：
         if (meanDeltaXPhys > meanDeltaYPhys) {
@@ -297,67 +269,39 @@ class ScreenRotationGestureDetector(
     /**
      * 将当前显示旋转下的触控点 (x_disp, y_disp) 逆变换还原回【平板机身绝对物理硬件坐标系】 (x_phys, y_phys)
      */
-    private fun toPhysicalPoint(xDisp: Float, yDisp: Float, rotation: Int, wDisp: Float, hDisp: Float): Point {
-        return when (rotation) {
-            Surface.ROTATION_0 -> Point(xDisp, yDisp)
-            Surface.ROTATION_90 -> Point(hDisp - yDisp, xDisp)
-            Surface.ROTATION_180 -> Point(wDisp - xDisp, hDisp - yDisp)
-            Surface.ROTATION_270 -> Point(yDisp, wDisp - xDisp)
-            else -> Point(xDisp, yDisp)
+    private fun physicalPoint(x: Float, y: Float, geometry: GestureDisplaySnapshot): Point =
+        Point(0f, 0f).also { setPhysicalPoint(it, x, y, geometry) }
+
+    private fun setPhysicalPoint(point: Point, x: Float, y: Float, geometry: GestureDisplaySnapshot) {
+        when (geometry.rotation) {
+            Surface.ROTATION_90 -> {
+                point.x = geometry.height - y
+                point.y = x
+            }
+            Surface.ROTATION_180 -> {
+                point.x = geometry.width - x
+                point.y = geometry.height - y
+            }
+            Surface.ROTATION_270 -> {
+                point.x = y
+                point.y = geometry.width - x
+            }
+            else -> {
+                point.x = x
+                point.y = y
+            }
         }
     }
 
-    private fun resetToIdle(reason: String) {
-        if (currentState != State.IDLE) {
-            XposedBridge.log("[$TAG] Reset to IDLE: $reason")
-        }
+    fun resetToIdle() {
         currentState = State.IDLE
         tap1Record = null
+        firstTapDisplay = null
+        tapDisplay = null
         p0StartPhys = null
         p1StartPhys = null
         p0CurrentPhys = null
         p1CurrentPhys = null
-        isDisqualified = false
         maxPointersInTap = 0
-    }
-
-    private fun getCurrentRotation(): Int {
-        val ctx = contextProvider()
-        if (ctx != null) {
-            try {
-                val dm = ctx.getSystemService(Context.DISPLAY_SERVICE) as? android.hardware.display.DisplayManager
-                val display = dm?.getDisplay(android.view.Display.DEFAULT_DISPLAY)
-                if (display != null) {
-                    return display.rotation
-                }
-            } catch (_: Throwable) {}
-        }
-        return Surface.ROTATION_0
-    }
-
-    private fun getScreenDimensions(): Pair<Float, Float> {
-        val ctx = contextProvider()
-        if (ctx != null) {
-            try {
-                val dm = ctx.getSystemService(Context.DISPLAY_SERVICE) as? android.hardware.display.DisplayManager
-                val display = dm?.getDisplay(android.view.Display.DEFAULT_DISPLAY)
-                if (display != null) {
-                    val metrics = DisplayMetrics()
-                    @Suppress("DEPRECATION")
-                    display.getRealMetrics(metrics)
-                    return Pair(metrics.widthPixels.toFloat(), metrics.heightPixels.toFloat())
-                }
-            } catch (t: Throwable) {
-                XposedBridge.log("[$TAG] Failed to getRealMetrics from DisplayManager: ${t.message}")
-            }
-        }
-        val sysMetrics = android.content.res.Resources.getSystem().displayMetrics
-        return Pair(sysMetrics.widthPixels.toFloat(), sysMetrics.heightPixels.toFloat())
-    }
-
-    private fun getDisplayDensity(): Float {
-        val ctx = contextProvider()
-        return ctx?.resources?.displayMetrics?.density
-            ?: android.content.res.Resources.getSystem().displayMetrics.density
     }
 }

@@ -15,7 +15,7 @@ package io.github.benbaobaoshigemi.rotationcontrol
 internal class TouchStreamArbiter {
     enum class Decision { DROP, ACCEPT, RESTART }
 
-    private var downTime: Long? = null
+    private var downTime = Long.MIN_VALUE
     private var deviceId = 0
     private var owner: String? = null
     private var finished = false
@@ -23,8 +23,8 @@ internal class TouchStreamArbiter {
     fun accept(timeDown: Long, device: Int, action: Int, channel: String): Decision {
         if (action == 0 /* ACTION_DOWN */) {
             // A duplicate or late DOWN must never rewind any detector's state.
-            if (downTime != null && timeDown <= downTime!!) return Decision.DROP
-            val interrupted = downTime != null && !finished
+            if (timeDown <= downTime) return Decision.DROP
+            val interrupted = downTime != Long.MIN_VALUE && !finished
             downTime = timeDown
             deviceId = device
             owner = channel

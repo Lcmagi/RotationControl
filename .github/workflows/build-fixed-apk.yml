@@ -29,14 +29,14 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/RotationControl-touch-stream-fix.apk
+          cp app/build/outputs/apk/debug/app-debug.apk dist/RotationControl-touch-path-perf.apk
           "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose --print-certs dist/*.apk > dist/signature.txt
           git rev-parse HEAD > dist/commit.txt
           sha256sum dist/*.apk > dist/SHA256SUMS
           echo 'Build and JVM routing tests only; no physical-device gesture verification.' > dist/VALIDATION.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: RotationControl-touch-stream-fix
+          name: RotationControl-touch-path-perf
           path: dist/
           if-no-files-found: error
           retention-days: 30

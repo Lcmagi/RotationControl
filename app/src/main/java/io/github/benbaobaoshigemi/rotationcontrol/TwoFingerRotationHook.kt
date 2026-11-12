@@ -1,11 +1,15 @@
 package io.github.benbaobaoshigemi.rotationcontrol
 
 import android.content.Context
-import android.os.IBinder
+import android.hardware.display.DisplayManager
+import android.content.res.Resources
+import android.os.SystemClock
+import android.util.DisplayMetrics
 import android.util.Log
-import android.view.InputDevice
+import android.view.Display
 import android.view.InputEvent
 import android.view.MotionEvent
+import android.view.Surface
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -22,37 +26,26 @@ import java.lang.reflect.Proxy
 object TwoFingerRotationHook {
     private const val TAG = "LSPosed-Rotation"
     private var isWmsListenerRegistered = false
-    private var systemContext: Context? = null
-    private var gestureDetector: ScreenRotationGestureDetector? = null
-    private var threeFingerSwipeDetector: ThreeFingerSwipeGestureDetector? = null
-    private var tripleTapDetector: ThreeFingerTripleTapDetector? = null
+    @Volatile private var systemContext: Context? = null
+    private var displayReadFailureLogged = false
 
-    private val touchStreamArbiter = TouchStreamArbiter()
+    private val gestureInput = GestureInputDispatcher(
+        loadDisplay = ::readGestureDisplay,
+        nowMillis = SystemClock::uptimeMillis,
+        enabledGestures = {
+            var enabled = 0
+            if (ConfigManager.isTwoFingerEnabled) enabled = enabled or GestureInputDispatcher.TWO_FINGER
+            if (ConfigManager.isBottomSwipeEnabled) enabled = enabled or GestureInputDispatcher.BOTTOM_SWIPE
+            if (ConfigManager.isTripleTapEnabled) enabled = enabled or GestureInputDispatcher.TRIPLE_TAP
+            enabled
+        },
+        onRotate = { rotation, reason -> RotationController.rotateScreen(rotation, reason) },
+        onToggleLock = { RotationController.toggleRotationLock() }
+    )
 
     fun hook(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "android") return
         XposedBridge.log("[$TAG] Attaching TwoFingerRotationHook to system_server")
-
-        // 1. 初始化双指点击旋转手势检测器
-        gestureDetector = ScreenRotationGestureDetector(
-            contextProvider = { systemContext }
-        ) { targetRotation, reason ->
-            RotationController.rotateScreen(targetRotation, reason)
-        }
-
-        // 2. 初始化底边三指横扫旋转手势检测器
-        threeFingerSwipeDetector = ThreeFingerSwipeGestureDetector(
-            contextProvider = { systemContext }
-        ) { targetRotation, reason ->
-            RotationController.rotateScreen(targetRotation, reason)
-        }
-
-        // 3. 初始化三指三击切换锁定手势检测器
-        tripleTapDetector = ThreeFingerTripleTapDetector(
-            contextProvider = { systemContext }
-        ) {
-            RotationController.toggleRotationLock()
-        }
 
         // ==========================================
         // 通道 1：WindowManagerService (WMS)
@@ -107,15 +100,8 @@ object TwoFingerRotationHook {
                 Int::class.javaPrimitiveType,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        val event = param.args[0] as? InputEvent ?: return
-                        if (event is MotionEvent) {
-                            // 仅处理来自屏幕的触摸事件
-                            val source = event.source
-                            if ((source and InputDevice.SOURCE_CLASS_POINTER) != 0 ||
-                                (source and InputDevice.SOURCE_TOUCHSCREEN) != 0) {
-                                onMotionEventReceived(event, "IMS-Filter")
-                            }
-                        }
+                        val event = param.args[0] as? MotionEvent ?: return
+                        gestureInput.onPointerEvent(event, "IMS-Filter")
                     }
                 }
             )
@@ -179,7 +165,7 @@ object TwoFingerRotationHook {
                             "onPointerEvent" -> {
                                 val event = args?.getOrNull(0) as? MotionEvent
                                 if (event != null) {
-                                    onMotionEventReceived(event, "WMS-PointerListener")
+                                    gestureInput.onPointerEvent(event, "WMS-PointerListener")
                                 }
                                 return null
                             }
@@ -218,44 +204,34 @@ object TwoFingerRotationHook {
         }
     }
 
-    /**
-     * 统一接收触摸事件流（带去重抑制）
-     */
-    @Synchronized
-    fun onMotionEventReceived(event: MotionEvent, channel: String) {
-        // Do not mix mouse streams into touchscreen gesture state via IMS.
-        if (!event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN)) return
-        val action = event.actionMasked
-        when (touchStreamArbiter.accept(event.downTime, event.deviceId, action, channel)) {
-            TouchStreamArbiter.Decision.DROP -> return
-            TouchStreamArbiter.Decision.RESTART -> {
-                // If an owner lost UP/CANCEL, cancel its incomplete gesture before
-                // accepting the next DOWN (which can choose the other channel).
-                val cancel = MotionEvent.obtain(event)
-                try {
-                    cancel.action = MotionEvent.ACTION_CANCEL
-                    gestureDetector?.onPointerEvent(cancel)
-                    threeFingerSwipeDetector?.onPointerEvent(cancel)
-                    tripleTapDetector?.onPointerEvent(cancel)
-                } finally {
-                    cancel.recycle()
+    @Suppress("DEPRECATION")
+    private fun readGestureDisplay(): GestureDisplaySnapshot {
+        val context = systemContext
+        val resources = context?.resources ?: Resources.getSystem()
+        val density = resources.displayMetrics.density
+        if (context != null) {
+            try {
+                val manager = context.getSystemService(DisplayManager::class.java)
+                val display = manager?.getDisplay(Display.DEFAULT_DISPLAY)
+                if (display != null) {
+                    val metrics = DisplayMetrics()
+                    display.getRealMetrics(metrics)
+                    return GestureDisplaySnapshot(
+                        metrics.widthPixels.toFloat(), metrics.heightPixels.toFloat(),
+                        display.rotation, density
+                    )
+                }
+            } catch (e: RuntimeException) {
+                if (!displayReadFailureLogged) {
+                    displayReadFailureLogged = true
+                    XposedBridge.log("[$TAG] Failed to read gesture display: ${e.message}")
                 }
             }
-            TouchStreamArbiter.Decision.ACCEPT -> Unit
         }
-
-        if (event.pointerCount >= 2 && action == MotionEvent.ACTION_POINTER_DOWN) {
-            XposedBridge.log("[$TAG] Touch stream active on $channel (pointers=${event.pointerCount}, action=$action)")
-        }
-
-        if (ConfigManager.isTwoFingerEnabled) {
-            gestureDetector?.onPointerEvent(event)
-        }
-        if (ConfigManager.isBottomSwipeEnabled) {
-            threeFingerSwipeDetector?.onPointerEvent(event)
-        }
-        if (ConfigManager.isTripleTapEnabled) {
-            tripleTapDetector?.onPointerEvent(event)
-        }
+        val metrics = Resources.getSystem().displayMetrics
+        return GestureDisplaySnapshot(
+            metrics.widthPixels.toFloat(), metrics.heightPixels.toFloat(),
+            Surface.ROTATION_0, density
+        )
     }
 }

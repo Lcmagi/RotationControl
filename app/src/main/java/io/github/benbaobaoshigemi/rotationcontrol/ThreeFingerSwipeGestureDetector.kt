@@ -1,12 +1,6 @@
 package io.github.benbaobaoshigemi.rotationcontrol
 
-import android.content.Context
-import android.os.SystemClock
-import android.util.DisplayMetrics
-import android.util.Log
 import android.view.MotionEvent
-import android.view.Surface
-import de.robv.android.xposed.XposedBridge
 import kotlin.math.abs
 
 /**
@@ -24,13 +18,11 @@ import kotlin.math.abs
  *    - 右扫：底边向右移，显示逆时针旋转 90 度 -> (currentRotation + 3) % 4
  * 5. 包含 600ms 触发闭锁与防抖冷却机制。
  */
-class ThreeFingerSwipeGestureDetector(
-    private val contextProvider: () -> Context?,
+internal class ThreeFingerSwipeGestureDetector(
+    private val display: GestureDisplay,
     private val onRotateAction: (targetRotation: Int, reason: String) -> Unit
 ) {
     companion object {
-        private const val TAG = "LSPosed-3FingerSwipe"
-
         // 区域与几何约束
         private const val BOTTOM_EDGE_RATIO = 0.75f               // 严格限定在屏幕底端 25% 区域
         private const val MIN_HORIZONTAL_SWIPE_DP = 100f          // 水平最小滑动位移阈值 (dp)
@@ -45,6 +37,7 @@ class ThreeFingerSwipeGestureDetector(
     private var hasTriggeredInCurrentStream = false
     private var lastTriggerTime = 0L
 
+    private var swipeDisplay: GestureDisplaySnapshot? = null
     private var swipeStartTime = 0L
     private var startCentroidX = 0f
     private var startCentroidY = 0f
@@ -53,18 +46,7 @@ class ThreeFingerSwipeGestureDetector(
     private val pointerDownX = FloatArray(10)
     private val pointerDownY = FloatArray(10)
 
-    private fun log(msg: String) {
-        Log.i(TAG, msg)
-        XposedBridge.log("[$TAG] $msg")
-    }
-
-    @Synchronized
-    fun onPointerEvent(event: MotionEvent) {
-        val actionMasked = event.actionMasked
-        val actionIndex = event.actionIndex
-        val pointerCount = event.pointerCount
-        val now = SystemClock.uptimeMillis()
-
+    fun onPointerEvent(event: MotionEvent, actionMasked: Int, pointerCount: Int, now: Long) {
         when (actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 val pid = event.getPointerId(0)
@@ -72,12 +54,11 @@ class ThreeFingerSwipeGestureDetector(
                     pointerDownX[pid] = event.getX(0)
                     pointerDownY[pid] = event.getY(0)
                 }
-                isTracking = false
-                isDisqualified = false
-                hasTriggeredInCurrentStream = false
+                resetStream()
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
+                val actionIndex = event.actionIndex
                 val pid = event.getPointerId(actionIndex)
                 if (pid < pointerDownX.size) {
                     pointerDownX[pid] = event.getX(actionIndex)
@@ -90,8 +71,8 @@ class ThreeFingerSwipeGestureDetector(
                         return
                     }
 
-                    val (_, hDisp) = getScreenDimensions()
-                    val bottomThreshold = hDisp * BOTTOM_EDGE_RATIO
+                    val geometry = display.read()
+                    val bottomThreshold = geometry.height * BOTTOM_EDGE_RATIO
 
                     // 获取三指起始重心坐标
                     val id0 = event.getPointerId(0)
@@ -115,11 +96,10 @@ class ThreeFingerSwipeGestureDetector(
                         isTracking = true
                         isDisqualified = false
                         hasTriggeredInCurrentStream = false
+                        swipeDisplay = geometry
                         swipeStartTime = now
                         startCentroidX = initX
                         startCentroidY = initY
-
-                        log("3 fingers placed in bottom edge zone: centroid=(${initX.toInt()}, ${initY.toInt()}), threshold=${bottomThreshold.toInt()}")
                     } else {
                         // 不在底边区域，彻底放弃监听，绝不干扰屏幕中上部的三指系统手势
                         isTracking = false
@@ -147,7 +127,7 @@ class ThreeFingerSwipeGestureDetector(
 
                     val deltaX = currX - startCentroidX
                     val deltaY = currY - startCentroidY
-                    val density = getDisplayDensity()
+                    val density = swipeDisplay?.density ?: return
                     val maxVerticalDevPx = MAX_VERTICAL_DEVIATION_DP * density
                     val minHorizontalPx = MIN_HORIZONTAL_SWIPE_DP * density
 
@@ -155,7 +135,6 @@ class ThreeFingerSwipeGestureDetector(
                     if (abs(deltaY) > maxVerticalDevPx) {
                         isTracking = false
                         isDisqualified = true
-                        log("Vertical deviation exceeded limit (dy=${deltaY.toInt()} > ${maxVerticalDevPx.toInt()}px) -> Disqualified (Pass through to system vertical gestures)")
                         return
                     }
 
@@ -174,7 +153,7 @@ class ThreeFingerSwipeGestureDetector(
 
                     val deltaX = currX - startCentroidX
                     val deltaY = currY - startCentroidY
-                    val density = getDisplayDensity()
+                    val density = swipeDisplay?.density ?: return
                     val maxVerticalDevPx = MAX_VERTICAL_DEVIATION_DP * density
                     val minHorizontalPx = MIN_HORIZONTAL_SWIPE_DP * density
 
@@ -191,19 +170,23 @@ class ThreeFingerSwipeGestureDetector(
             }
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                isTracking = false
-                isDisqualified = false
-                hasTriggeredInCurrentStream = false
+                resetStream()
             }
         }
     }
 
     private fun checkAndTrigger(deltaX: Float, deltaY: Float, now: Long) {
+        val geometry = swipeDisplay ?: return
+        if (display.read() != geometry) {
+            isTracking = false
+            isDisqualified = true
+            return
+        }
         hasTriggeredInCurrentStream = true
         isTracking = false
         lastTriggerTime = now
 
-        val currentRotation = getCurrentRotation()
+        val currentRotation = geometry.rotation
         val isLeftSwipe = deltaX < 0
 
         // 左扫：顺时针 +90° ((current + 1) % 4)
@@ -217,45 +200,13 @@ class ThreeFingerSwipeGestureDetector(
         val directionStr = if (isLeftSwipe) "LEFT (Clockwise +90°)" else "RIGHT (Counter-Clockwise -90°)"
         val reason = "3-finger swipe $directionStr at display bottom (dx=${deltaX.toInt()}, dy=${deltaY.toInt()}, $currentRotation -> $targetRotation)"
 
-        log("Triggered! $reason")
         onRotateAction(targetRotation, reason)
     }
 
-    private fun getCurrentRotation(): Int {
-        val ctx = contextProvider()
-        if (ctx != null) {
-            try {
-                val dm = ctx.getSystemService(Context.DISPLAY_SERVICE) as? android.hardware.display.DisplayManager
-                val display = dm?.getDisplay(android.view.Display.DEFAULT_DISPLAY)
-                if (display != null) {
-                    return display.rotation
-                }
-            } catch (_: Throwable) {}
-        }
-        return Surface.ROTATION_0
-    }
-
-    private fun getScreenDimensions(): Pair<Float, Float> {
-        val ctx = contextProvider()
-        if (ctx != null) {
-            try {
-                val dm = ctx.getSystemService(Context.DISPLAY_SERVICE) as? android.hardware.display.DisplayManager
-                val display = dm?.getDisplay(android.view.Display.DEFAULT_DISPLAY)
-                if (display != null) {
-                    val metrics = DisplayMetrics()
-                    @Suppress("DEPRECATION")
-                    display.getRealMetrics(metrics)
-                    return Pair(metrics.widthPixels.toFloat(), metrics.heightPixels.toFloat())
-                }
-            } catch (_: Throwable) {}
-        }
-        val sysMetrics = android.content.res.Resources.getSystem().displayMetrics
-        return Pair(sysMetrics.widthPixels.toFloat(), sysMetrics.heightPixels.toFloat())
-    }
-
-    private fun getDisplayDensity(): Float {
-        val ctx = contextProvider()
-        return ctx?.resources?.displayMetrics?.density
-            ?: android.content.res.Resources.getSystem().displayMetrics.density
+    fun resetStream() {
+        swipeDisplay = null
+        isTracking = false
+        isDisqualified = false
+        hasTriggeredInCurrentStream = false
     }
 }
