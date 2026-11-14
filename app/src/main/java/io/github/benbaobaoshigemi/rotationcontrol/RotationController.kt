@@ -1,12 +1,16 @@
 package io.github.benbaobaoshigemi.rotationcontrol
 
+import android.app.KeyguardManager
 import android.content.Context
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.Settings
+import android.view.Display
 import android.view.Surface
 import de.robv.android.xposed.XposedBridge
 
@@ -23,6 +27,18 @@ object RotationController {
     private var appContext: Context? = null
     private var wmsInstance: Any? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val panelOverride = PanelRotationOverride()
+    private var displayManager: DisplayManager? = null
+    private var listeningForPanelChanges = false
+    private val panelListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = onDisplayChanged(displayId)
+        override fun onDisplayRemoved(displayId: Int) = Unit
+
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId != Display.DEFAULT_DISPLAY) return
+            restoreRotationAfterPanelChange()
+        }
+    }
 
     /**
      * 旋转模式配置：
@@ -34,6 +50,17 @@ object RotationController {
     fun init(context: Context, wms: Any) {
         appContext = context
         wmsInstance = wms
+        if (!listeningForPanelChanges) {
+            try {
+                displayManager = context.getSystemService(DisplayManager::class.java)
+                displayManager?.let {
+                    it.registerDisplayListener(panelListener, mainHandler)
+                    listeningForPanelChanges = true
+                }
+            } catch (e: RuntimeException) {
+                XposedBridge.log("[$TAG] Failed to observe display changes: ${e.message}")
+            }
+        }
         XposedBridge.log("[$TAG] RotationController initialized with Context and WindowManagerService")
     }
 
@@ -45,7 +72,12 @@ object RotationController {
     fun rotateScreen(targetRotation: Int, reason: String) {
         mainHandler.post {
             try {
-                val context = appContext
+                val context = appContext ?: return@post
+                if (!canRunGesture(context)) return@post
+                // Reconcile first if the display callback is still queued.
+                restoreRotationAfterPanelChange()
+                val panel = currentPanel()
+                val before = readRotationSettings(context)
                 val wms = wmsInstance
 
                 val currentRotation = getCurrentRotation()
@@ -64,46 +96,12 @@ object RotationController {
                     "[$TAG] Intent: Pointing to $finalRotation (current=$currentRotation, reason=$reason)"
                 )
 
-                // 幂等性检查：若当前屏幕已处于目标指向，不重复执行破坏性翻转
-                if (currentRotation == finalRotation) {
-                    XposedBridge.log("[$TAG] Display is already at target orientation $finalRotation. Keeping orientation locked.")
-                    if (context != null) {
-                        try {
-                            Settings.System.putInt(context.contentResolver, Settings.System.ACCELEROMETER_ROTATION, 0)
-                            Settings.System.putInt(context.contentResolver, Settings.System.USER_ROTATION, finalRotation)
-                        } catch (_: Throwable) {}
-                        triggerHapticFeedback(context)
-                    }
-                    return@post
-                }
-
-                // 1. 调用 WindowManagerService.freezeRotation 冻结并立即更新显示角度
-                var wmsSuccess = false
-                if (wms != null) {
-                    wmsSuccess = invokeWmsFreeze(wms, finalRotation)
-                }
-
-                // 2. 更新 Settings.System 保证系统级持久化并唤醒 DisplayRotation 观察者
-                if (context != null) {
-                    try {
-                        Settings.System.putInt(
-                            context.contentResolver,
-                            Settings.System.ACCELEROMETER_ROTATION,
-                            0
-                        )
-                        Settings.System.putInt(
-                            context.contentResolver,
-                            Settings.System.USER_ROTATION,
-                            finalRotation
-                        )
-                        XposedBridge.log("[$TAG] Settings.System updated: USER_ROTATION=$finalRotation, ACCELEROMETER_ROTATION=0")
-                    } catch (t: Throwable) {
-                        XposedBridge.log("[$TAG] Failed to update Settings.System: ${t.message}")
-                    }
-
-                    // 3. 触觉震动反馈，给用户明确的手势触发确认
-                    triggerHapticFeedback(context)
-                }
+                val applied = PanelRotationOverride.Settings(0, finalRotation)
+                val wmsSuccess = currentRotation != finalRotation && wms != null &&
+                    invokeWmsFreeze(wms, finalRotation)
+                writeRotationSettings(context, applied)
+                if (panel != null) panelOverride.record(panel, before, applied)
+                triggerHapticFeedback(context)
 
                 XposedBridge.log("[$TAG] Rotation execution finished: finalRotation=$finalRotation, wmsSuccess=$wmsSuccess")
             } catch (t: Throwable) {
@@ -119,6 +117,10 @@ object RotationController {
         mainHandler.post {
             try {
                 val context = appContext ?: return@post
+                if (!canRunGesture(context)) return@post
+                restoreRotationAfterPanelChange()
+                // The three-tap toggle is an explicit change to system policy.
+                panelOverride.clear()
 
                 // 优先通过系统原生内部类 RotationPolicy 切换（与下拉通知栏快捷磁贴 100% 同源）
                 var nativeSuccess = false
@@ -160,6 +162,49 @@ object RotationController {
             } catch (t: Throwable) {
                 XposedBridge.log("[$TAG] toggleRotationLock error: ${t.message}")
             }
+        }
+    }
+
+    private fun canRunGesture(context: Context): Boolean {
+        val keyguard = context.getSystemService(KeyguardManager::class.java)
+        val power = context.getSystemService(PowerManager::class.java)
+        return keyguard?.isKeyguardLocked == false && power?.isInteractive == true
+    }
+
+    private fun currentPanel(): PanelRotationOverride.Panel? {
+        val mode = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)?.mode ?: return null
+        // Physical mode dimensions do not rotate with the UI. Refresh rate is irrelevant.
+        return PanelRotationOverride.Panel(mode.physicalWidth, mode.physicalHeight)
+    }
+
+    private fun readRotationSettings(context: Context): PanelRotationOverride.Settings {
+        val resolver = context.contentResolver
+        return PanelRotationOverride.Settings(
+            Settings.System.getInt(resolver, Settings.System.ACCELEROMETER_ROTATION, 0),
+            Settings.System.getInt(resolver, Settings.System.USER_ROTATION, Surface.ROTATION_0)
+        )
+    }
+
+    private fun writeRotationSettings(context: Context, settings: PanelRotationOverride.Settings) {
+        val resolver = context.contentResolver
+        check(Settings.System.putInt(resolver, Settings.System.USER_ROTATION, settings.angle))
+        check(Settings.System.putInt(resolver, Settings.System.ACCELEROMETER_ROTATION, settings.autoRotate))
+    }
+
+    private fun restoreRotationAfterPanelChange() {
+        if (!panelOverride.isActive) return
+        try {
+            val context = appContext ?: return
+            val panel = currentPanel() ?: return
+            val previous = panelOverride.onPanelChanged(panel) { readRotationSettings(context) } ?: return
+            val wms = wmsInstance
+            if (wms != null) {
+                if (previous.autoRotate == 1) invokeWmsThaw(wms) else invokeWmsFreeze(wms, previous.angle)
+            }
+            writeRotationSettings(context, previous)
+            XposedBridge.log("[$TAG] Restored rotation settings after display size change")
+        } catch (e: RuntimeException) {
+            XposedBridge.log("[$TAG] Could not restore rotation settings: ${e.message}")
         }
     }
 

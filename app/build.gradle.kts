@@ -27,7 +27,7 @@ android {
         }
         debug {
             isMinifyEnabled = false
-            versionNameSuffix = "-touch-path-perf"
+            versionNameSuffix = "-fold-rotation-lock"
         }
     }
 
