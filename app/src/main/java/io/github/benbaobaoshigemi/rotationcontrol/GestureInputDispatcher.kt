@@ -8,8 +8,8 @@ internal class GestureInputDispatcher(
     loadDisplay: () -> GestureDisplaySnapshot,
     private val nowMillis: () -> Long,
     private val enabledGestures: () -> Int,
-    onRotate: (Int, String) -> Unit,
-    onToggleLock: () -> Unit
+    onRotate: (Int, String, PanelRotationOverride.Panel?) -> Unit,
+    onToggleLock: (PanelRotationOverride.Panel?) -> Unit
 ) {
     companion object {
         const val TWO_FINGER = 1
@@ -20,9 +20,10 @@ internal class GestureInputDispatcher(
     private val lock = Any()
     private val arbiter = TouchStreamArbiter()
     private val display = GestureDisplay(loadDisplay)
-    private val twoFinger = ScreenRotationGestureDetector(display, onRotate)
-    private val swipe = ThreeFingerSwipeGestureDetector(display, onRotate)
-    private val tripleTap = ThreeFingerTripleTapDetector(display, onToggleLock)
+    private val rotate = { angle: Int, reason: String -> onRotate(angle, reason, display.read().panel) }
+    private val twoFinger = ScreenRotationGestureDetector(display, rotate)
+    private val swipe = ThreeFingerSwipeGestureDetector(display, rotate)
+    private val tripleTap = ThreeFingerTripleTapDetector(display) { onToggleLock(display.read().panel) }
 
     fun onPointerEvent(event: MotionEvent, channel: String) {
         if (!event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN)) return

@@ -160,7 +160,7 @@ class GestureInputDispatcherTest {
                 GestureInputDispatcher.TWO_FINGER or GestureInputDispatcher.BOTTOM_SWIPE or
                     GestureInputDispatcher.TRIPLE_TAP
             },
-            onRotate = { rotation, _ -> rotations.add(rotation) },
+            onRotate = { rotation, _, _ -> rotations.add(rotation) },
             onToggleLock = { toggles++ }
         )
 

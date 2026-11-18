@@ -5,7 +5,8 @@ internal data class GestureDisplaySnapshot(
     val width: Float,
     val height: Float,
     val rotation: Int,
-    val density: Float
+    val density: Float,
+    val panel: PanelRotationOverride.Panel? = null
 )
 
 /**

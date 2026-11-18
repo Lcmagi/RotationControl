@@ -27,7 +27,7 @@ android {
         }
         debug {
             isMinifyEnabled = false
-            versionNameSuffix = "-fold-rotation-lock"
+            versionNameSuffix = "-fold-recovery"
         }
     }
 

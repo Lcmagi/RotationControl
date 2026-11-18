@@ -39,8 +39,8 @@ object TwoFingerRotationHook {
             if (ConfigManager.isTripleTapEnabled) enabled = enabled or GestureInputDispatcher.TRIPLE_TAP
             enabled
         },
-        onRotate = { rotation, reason -> RotationController.rotateScreen(rotation, reason) },
-        onToggleLock = { RotationController.toggleRotationLock() }
+        onRotate = RotationController::rotateScreen,
+        onToggleLock = RotationController::toggleRotationLock
     )
 
     fun hook(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -218,7 +218,7 @@ object TwoFingerRotationHook {
                     display.getRealMetrics(metrics)
                     return GestureDisplaySnapshot(
                         metrics.widthPixels.toFloat(), metrics.heightPixels.toFloat(),
-                        display.rotation, density
+                        display.rotation, metrics.density, display.mode.let { PanelRotationOverride.Panel(it.physicalWidth, it.physicalHeight) }
                     )
                 }
             } catch (e: RuntimeException) {

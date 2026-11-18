@@ -69,14 +69,15 @@ object RotationController {
      * @param targetRotation Surface.ROTATION_0, Surface.ROTATION_90, Surface.ROTATION_180, Surface.ROTATION_270
      * @param reason 触发原因与算法决策描述
      */
-    fun rotateScreen(targetRotation: Int, reason: String) {
+    internal fun rotateScreen(targetRotation: Int, reason: String, origin: PanelRotationOverride.Panel?) {
         mainHandler.post {
             try {
                 val context = appContext ?: return@post
                 if (!canRunGesture(context)) return@post
                 // Reconcile first if the display callback is still queued.
-                restoreRotationAfterPanelChange()
-                val panel = currentPanel()
+                if (!restoreRotationAfterPanelChange()) return@post
+                val panel = currentPanel() ?: return@post
+                if (!panel.acceptsGestureFrom(origin)) return@post
                 val before = readRotationSettings(context)
                 val wms = wmsInstance
 
@@ -97,14 +98,14 @@ object RotationController {
                 )
 
                 val applied = PanelRotationOverride.Settings(0, finalRotation)
+                panelOverride.apply(panel, before, applied) { from, to -> writeSetting(context, from, to) }
                 val wmsSuccess = currentRotation != finalRotation && wms != null &&
                     invokeWmsFreeze(wms, finalRotation)
-                writeRotationSettings(context, applied)
-                if (panel != null) panelOverride.record(panel, before, applied)
                 triggerHapticFeedback(context)
 
                 XposedBridge.log("[$TAG] Rotation execution finished: finalRotation=$finalRotation, wmsSuccess=$wmsSuccess")
             } catch (t: Throwable) {
+                restoreRotationAfterPanelChange()
                 XposedBridge.log("[$TAG] Error during rotateScreen execution: ${t.message}")
             }
         }
@@ -113,12 +114,13 @@ object RotationController {
     /**
      * 切换系统原生屏幕旋转锁定状态
      */
-    fun toggleRotationLock() {
+    internal fun toggleRotationLock(origin: PanelRotationOverride.Panel?) {
         mainHandler.post {
             try {
                 val context = appContext ?: return@post
                 if (!canRunGesture(context)) return@post
-                restoreRotationAfterPanelChange()
+                if (!restoreRotationAfterPanelChange()) return@post
+                if (currentPanel()?.acceptsGestureFrom(origin) != true) return@post
                 // The three-tap toggle is an explicit change to system policy.
                 panelOverride.clear()
 
@@ -185,26 +187,30 @@ object RotationController {
         )
     }
 
-    private fun writeRotationSettings(context: Context, settings: PanelRotationOverride.Settings) {
+    private fun writeSetting(context: Context, from: PanelRotationOverride.Settings, to: PanelRotationOverride.Settings) {
         val resolver = context.contentResolver
-        check(Settings.System.putInt(resolver, Settings.System.USER_ROTATION, settings.angle))
-        check(Settings.System.putInt(resolver, Settings.System.ACCELEROMETER_ROTATION, settings.autoRotate))
+        if (from.angle != to.angle) {
+            check(Settings.System.putInt(resolver, Settings.System.USER_ROTATION, to.angle))
+        } else {
+            check(Settings.System.putInt(resolver, Settings.System.ACCELEROMETER_ROTATION, to.autoRotate))
+        }
     }
 
-    private fun restoreRotationAfterPanelChange() {
-        if (!panelOverride.isActive) return
+    private fun restoreRotationAfterPanelChange(): Boolean {
+        if (!panelOverride.isActive) return true
         try {
-            val context = appContext ?: return
-            val panel = currentPanel() ?: return
-            val previous = panelOverride.onPanelChanged(panel) { readRotationSettings(context) } ?: return
+            val context = appContext ?: return false
+            val panel = currentPanel() ?: return false
+            val previous = panelOverride.restore(panel, { readRotationSettings(context) }) { from, to -> writeSetting(context, from, to) } ?: return !panelOverride.needsRecovery
             val wms = wmsInstance
             if (wms != null) {
                 if (previous.autoRotate == 1) invokeWmsThaw(wms) else invokeWmsFreeze(wms, previous.angle)
             }
-            writeRotationSettings(context, previous)
             XposedBridge.log("[$TAG] Restored rotation settings after display size change")
+            return true
         } catch (e: RuntimeException) {
             XposedBridge.log("[$TAG] Could not restore rotation settings: ${e.message}")
+            return false
         }
     }
 
@@ -266,6 +272,7 @@ object RotationController {
             }
         }
 
+        if (success) return true
         // 尝试 freezeDisplayRotation(int displayId, int rotation, String caller)
         try {
             val methodDisplay = wms.javaClass.methods.firstOrNull {
@@ -313,6 +320,7 @@ object RotationController {
             } catch (_: Throwable) {}
         }
 
+        if (success) return true
         try {
             val methodDisplay = wms.javaClass.methods.firstOrNull { it.name == "thawDisplayRotation" }
             if (methodDisplay != null) {

@@ -16,37 +16,79 @@ class PanelRotationOverrideTest {
     private val automatic = Settings(1, 0)
     private val policy = PanelRotationOverride()
 
+    private fun record(panel: Panel, before: Settings, after: Settings) =
+        policy.apply(panel, before, after) { _, _ -> }
+
+    private fun restore(panel: Panel, read: () -> Settings): Settings? {
+        var written: Settings? = null
+        return policy.restore(panel, { written ?: read() }) { _, to -> written = to }
+    }
+
+    @Test fun queuedInnerGestureIsRejectedOnOuterPanel() {
+        assertFalse(outer.acceptsGestureFrom(inner))
+        assertFalse(outer.acceptsGestureFrom(null))
+        assertEquals(true, inner.acceptsGestureFrom(inner))
+    }
+
+    @Test fun failedSecondWriteCanRecoverOnOriginalPanel() {
+        var current = automatic
+        runCatching {
+            policy.apply(inner, current, landscape) { _, to ->
+                if (to == landscape) error("write failed")
+                current = to
+            }
+        }
+        assertEquals(Settings(1, 1), current)
+        assertEquals(automatic, policy.restore(inner, { current }) { _, to -> current = to })
+        assertEquals(automatic, current)
+    }
+
+    @Test fun partialRestoreRetriesAfterReadOrWriteFailure() {
+        record(inner, automatic, landscape)
+        var current = landscape
+        runCatching { policy.restore(outer, { error("read failed") }) { _, _ -> } }
+        runCatching {
+            policy.restore(outer, { current }) { _, to ->
+                if (to == automatic) error("write failed")
+                current = to
+            }
+        }
+        assertEquals(portrait, current)
+        assertEquals(automatic, policy.restore(outer, { current }) { _, to -> current = to })
+        assertEquals(automatic, current)
+    }
+
     @Test fun restoresOriginalPortraitLockAfterRepeatedGesturesOnTheSamePanel() {
-        policy.record(inner, portrait, landscape)
-        policy.record(inner, landscape, reversed)
-        assertEquals(portrait, policy.onPanelChanged(outer) { reversed })
+        record(inner, portrait, landscape)
+        record(inner, landscape, reversed)
+        assertEquals(portrait, restore(outer) { reversed })
         assertFalse(policy.isActive)
     }
 
     @Test fun restoresAutomaticRotationIfItWasOnBeforeTheGesture() {
-        policy.record(inner, automatic, landscape)
-        assertEquals(automatic, policy.onPanelChanged(outer) { landscape })
+        record(inner, automatic, landscape)
+        assertEquals(automatic, restore(outer) { landscape })
     }
 
     @Test fun samePhysicalSizeDoesNotReadSettingsOrRestoreTheOverride() {
-        policy.record(inner, portrait, landscape)
-        assertNull(policy.onPanelChanged(inner) { error("Should not read settings") })
-        assertEquals(portrait, policy.onPanelChanged(outer) { landscape })
+        record(inner, portrait, landscape)
+        assertNull(restore(inner) { error("Should not read settings") })
+        assertEquals(portrait, restore(outer) { landscape })
     }
 
     @Test fun preservesAUserChangeMadeAfterTheGesture() {
-        policy.record(inner, portrait, landscape)
-        assertNull(policy.onPanelChanged(outer) { automatic })
+        record(inner, portrait, landscape)
+        assertNull(restore(outer) { automatic })
         assertFalse(policy.isActive)
     }
 
     @Test fun explicitRotationLockToggleDropsTheModuleOverride() {
-        policy.record(inner, portrait, landscape)
+        record(inner, portrait, landscape)
         policy.clear()
-        assertNull(policy.onPanelChanged(outer) { error("Should not read settings") })
+        assertNull(restore(outer) { error("Should not read settings") })
     }
 
     @Test fun noGestureMeansNoAutomaticSettingsWriteOnFold() {
-        assertNull(policy.onPanelChanged(outer) { error("Should not read settings") })
+        assertNull(restore(outer) { error("Should not read settings") })
     }
 }
