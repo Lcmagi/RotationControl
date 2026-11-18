@@ -1,3 +1,4 @@
+// Modified in the Lcmagi/RotationControl fork for regression tests and fork build identification.
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")

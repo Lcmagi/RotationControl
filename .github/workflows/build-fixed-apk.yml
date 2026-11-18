@@ -31,6 +31,10 @@ jobs:
           mkdir -p dist
           cp app/build/outputs/apk/debug/app-debug.apk dist/RotationControl-fold-recovery.apk
           "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose --print-certs dist/*.apk > dist/signature.txt
+          for notice in Apache-2.0.txt RotationControl.txt; do
+            unzip -p dist/*.apk "assets/licenses/$notice" | cmp - "app/src/main/assets/licenses/$notice"
+            cp "app/src/main/assets/licenses/$notice" dist/
+          done
           git rev-parse HEAD > dist/commit.txt
           sha256sum dist/*.apk > dist/SHA256SUMS
           echo 'Build and JVM routing tests only; no physical-device gesture verification.' > dist/VALIDATION.txt

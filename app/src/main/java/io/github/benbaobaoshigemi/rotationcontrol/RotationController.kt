@@ -1,3 +1,4 @@
+// Modified in the Lcmagi/RotationControl fork. See README.md for changes.
 package io.github.benbaobaoshigemi.rotationcontrol
 
 import android.app.KeyguardManager
